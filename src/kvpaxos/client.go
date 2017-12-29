@@ -1,10 +1,12 @@
 package kvpaxos
 
-import "net/rpc"
-import "crypto/rand"
-import "math/big"
-
-import "fmt"
+import (
+	"crypto/rand"
+	"fmt"
+	"math/big"
+	"net/rpc"
+	"time"
+)
 
 type Clerk struct {
 	servers []string
@@ -68,10 +70,17 @@ func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
 	id := nrand()
 	var reply GetReply
-	for _, srv := range ck.servers {
-		success := call(srv, "KVPaxos.Get", &GetArgs{Key: key, Id: id}, &reply)
-		if success {
-			return reply.Value
+	waitTime := 10 * time.Millisecond
+	for {
+		for _, srv := range ck.servers {
+			success := call(srv, "KVPaxos.Get", &GetArgs{Key: key, Id: id}, &reply)
+			if success {
+				return reply.Value
+			}
+		}
+		time.Sleep(waitTime)
+		if waitTime < 10*time.Second {
+			waitTime *= 2
 		}
 	}
 
@@ -91,10 +100,17 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		Op:    op,
 		Id:    id,
 	}
-	for _, srv := range ck.servers {
-		success := call(srv, "KVPaxos.PutAppend", args, &reply)
-		if success {
-			return
+	waitTime := 10 * time.Millisecond
+	for {
+		for _, srv := range ck.servers {
+			success := call(srv, "KVPaxos.PutAppend", args, &reply)
+			if success {
+				return
+			}
+		}
+		time.Sleep(waitTime)
+		if waitTime < 10*time.Second {
+			waitTime *= 2
 		}
 	}
 	return

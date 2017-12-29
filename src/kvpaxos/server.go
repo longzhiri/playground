@@ -38,7 +38,7 @@ type KVPaxos struct {
 	px         *paxos.Paxos
 
 	// Your definitions here.
-	doneOpIdMap map[int64]string //op id -> cur value
+	doneOpIdMap map[int64]bool //op id -> cur value
 	kvMap       map[string]string
 	doneSeq     int
 }
@@ -49,9 +49,9 @@ func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
 		doneSeq := kv.executeDecidedOp()
 
 		kv.mu.Lock()
-		if value, exist := kv.doneOpIdMap[args.Id]; exist {
+		if kv.doneOpIdMap[args.Id] {
 			reply.Err = OK
-			reply.Value = value
+			reply.Value = kv.kvMap[args.Key]
 			kv.mu.Unlock()
 			return nil
 		}
@@ -104,7 +104,8 @@ func (kv *KVPaxos) executeDecidedOp() int {
 		if status != paxos.Decided {
 			break
 		}
-		switch args := value.(type) {
+		opValue := value.(Op)
+		switch args := opValue.Args.(type) {
 		case PutAppendArgs:
 			if _, exist := kv.doneOpIdMap[args.Id]; exist {
 				break
@@ -114,12 +115,12 @@ func (kv *KVPaxos) executeDecidedOp() int {
 			} else {
 				kv.kvMap[args.Key] = args.Value
 			}
-			kv.doneOpIdMap[args.Id] = kv.kvMap[args.Key]
+			kv.doneOpIdMap[args.Id] = true
 		case GetArgs:
 			if _, exist := kv.doneOpIdMap[args.Id]; exist {
 				break
 			}
-			kv.doneOpIdMap[args.Id] = kv.kvMap[args.Key]
+			kv.doneOpIdMap[args.Id] = true
 		}
 		kv.doneSeq++
 	}
@@ -164,6 +165,8 @@ func StartServer(servers []string, me int) *KVPaxos {
 	// call gob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	gob.Register(Op{})
+	gob.Register(PutAppendArgs{})
+	gob.Register(GetArgs{})
 
 	kv := new(KVPaxos)
 	kv.me = me
@@ -175,7 +178,7 @@ func StartServer(servers []string, me int) *KVPaxos {
 
 	kv.px = paxos.Make(servers, me, rpcs)
 	kv.doneSeq = -1
-	kv.doneOpIdMap = make(map[int64]string)
+	kv.doneOpIdMap = make(map[int64]bool)
 	kv.kvMap = make(map[string]string)
 
 	os.Remove(servers[me])
