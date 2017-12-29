@@ -1,16 +1,18 @@
 package pbservice
 
-import "viewservice"
-import "net/rpc"
-import "fmt"
-
-import "crypto/rand"
-import "math/big"
-
+import (
+	"crypto/rand"
+	"log"
+	"math/big"
+	"net/rpc"
+	"time"
+	"viewservice"
+)
 
 type Clerk struct {
 	vs *viewservice.Clerk
 	// Your declarations here
+	curView viewservice.View
 }
 
 // this may come in handy.
@@ -28,7 +30,6 @@ func MakeClerk(vshost string, me string) *Clerk {
 
 	return ck
 }
-
 
 //
 // call() sends an RPC to the rpcname handler on server srv
@@ -60,7 +61,7 @@ func call(srv string, rpcname string,
 		return true
 	}
 
-	fmt.Println(err)
+	//fmt.Printf("call rpcname=%v, err=%v\n", rpcname, err)
 	return false
 }
 
@@ -74,8 +75,36 @@ func call(srv string, rpcname string,
 func (ck *Clerk) Get(key string) string {
 
 	// Your code here.
+	if !ck.ensureView() {
+		return ""
+	}
 
-	return "???"
+RETRY:
+	var reply GetReply
+	success := call(ck.curView.Primary, "PBServer.Get", &GetArgs{Key: key}, &reply)
+	if !success {
+		time.Sleep(viewservice.PingInterval)
+		ck.curView.Primary = ""
+		if !ck.ensureView() {
+			return ""
+		}
+
+		goto RETRY
+	}
+	if reply.Err == ErrViewChanged {
+		v, b := ck.vs.Get()
+		if !b {
+			log.Printf("get view service failed")
+			return ""
+		}
+		ck.curView = v
+		goto RETRY
+	} else if reply.Err == OK {
+		return reply.Value
+	} else {
+		log.Printf("call PBServer.Get Reply error:%v", reply.Err)
+		return ""
+	}
 }
 
 //
@@ -84,6 +113,56 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 
 	// Your code here.
+	if !ck.ensureView() {
+		return
+	}
+	opId := nrand()
+
+RETRY:
+	var reply PutAppendReply
+	args := &PutAppendArgs{
+		Key:    key,
+		Value:  value,
+		OpType: op,
+		OpId:   opId,
+	}
+	success := call(ck.curView.Primary, "PBServer.PutAppend", args, &reply)
+	if !success {
+		time.Sleep(viewservice.PingInterval)
+		ck.curView.Primary = ""
+		if !ck.ensureView() {
+			return
+		}
+		goto RETRY
+	}
+	if reply.Err == ErrViewChanged {
+		v, b := ck.vs.Get()
+		if !b {
+			log.Printf("get view service failed")
+			return
+		}
+		ck.curView = v
+		goto RETRY
+	} else if reply.Err != OK && reply.Err != ErrDuplicateOp {
+		log.Printf("call PBServer.PutAppend Reply error:%v", reply.Err)
+	}
+}
+
+func (ck *Clerk) ensureView() bool {
+	for ck.curView.Primary == "" {
+
+		v, b := ck.vs.Get()
+		if !b {
+			log.Printf("get view service failed")
+			return false
+		}
+		ck.curView = v
+		if ck.curView.Primary != "" {
+			return true
+		}
+		time.Sleep(viewservice.PingInterval)
+	}
+	return true
 }
 
 //
@@ -100,4 +179,8 @@ func (ck *Clerk) Put(key string, value string) {
 //
 func (ck *Clerk) Append(key string, value string) {
 	ck.PutAppend(key, value, "Append")
+}
+
+func init() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
 }

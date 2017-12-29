@@ -11,7 +11,7 @@ import "os"
 import "syscall"
 import "encoding/gob"
 import "math/rand"
-
+import "time"
 
 const Debug = 0
 
@@ -22,11 +22,11 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Args interface{}
 }
 
 type KVPaxos struct {
@@ -38,18 +38,93 @@ type KVPaxos struct {
 	px         *paxos.Paxos
 
 	// Your definitions here.
+	doneOpIdMap map[int64]string //op id -> cur value
+	kvMap       map[string]string
+	doneSeq     int
 }
-
 
 func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
 	// Your code here.
+	for {
+		doneSeq := kv.executeDecidedOp()
+
+		kv.mu.Lock()
+		if value, exist := kv.doneOpIdMap[args.Id]; exist {
+			reply.Err = OK
+			reply.Value = value
+			kv.mu.Unlock()
+			return nil
+		}
+		kv.mu.Unlock()
+		kv.doAgreement(Op{*args}, doneSeq+1)
+	}
+
 	return nil
 }
 
 func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
-	// Your code here.
+	for {
+		doneSeq := kv.executeDecidedOp()
+
+		kv.mu.Lock()
+		if _, exist := kv.doneOpIdMap[args.Id]; exist {
+			reply.Err = OK
+			kv.mu.Unlock()
+			return nil
+		}
+		kv.mu.Unlock()
+		kv.doAgreement(Op{*args}, doneSeq+1)
+	}
 
 	return nil
+}
+
+func (kv *KVPaxos) doAgreement(op Op, seq int) {
+	kv.px.Start(seq, op)
+
+	waitTime := 10 * time.Millisecond
+	for {
+		status, _ := kv.px.Status(seq)
+		if status == paxos.Decided || status == paxos.Forgotten {
+			break
+		}
+		time.Sleep(waitTime)
+		if waitTime < 10*time.Second {
+			waitTime *= 2
+		}
+	}
+}
+
+func (kv *KVPaxos) executeDecidedOp() int {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	for i := kv.doneSeq + 1; i <= kv.px.Max(); i++ {
+		status, value := kv.px.Status(i)
+		if status != paxos.Decided {
+			break
+		}
+		switch args := value.(type) {
+		case PutAppendArgs:
+			if _, exist := kv.doneOpIdMap[args.Id]; exist {
+				break
+			}
+			if args.Op == "Append" {
+				kv.kvMap[args.Key] = kv.kvMap[args.Key] + args.Value
+			} else {
+				kv.kvMap[args.Key] = args.Value
+			}
+			kv.doneOpIdMap[args.Id] = kv.kvMap[args.Key]
+		case GetArgs:
+			if _, exist := kv.doneOpIdMap[args.Id]; exist {
+				break
+			}
+			kv.doneOpIdMap[args.Id] = kv.kvMap[args.Key]
+		}
+		kv.doneSeq++
+	}
+	kv.px.Done(kv.doneSeq)
+	return kv.doneSeq
 }
 
 // tell the server to shut itself down.
@@ -99,6 +174,9 @@ func StartServer(servers []string, me int) *KVPaxos {
 	rpcs.Register(kv)
 
 	kv.px = paxos.Make(servers, me, rpcs)
+	kv.doneSeq = -1
+	kv.doneOpIdMap = make(map[int64]string)
+	kv.kvMap = make(map[string]string)
 
 	os.Remove(servers[me])
 	l, e := net.Listen("unix", servers[me])
@@ -106,7 +184,6 @@ func StartServer(servers []string, me int) *KVPaxos {
 		log.Fatal("listen error: ", e)
 	}
 	kv.l = l
-
 
 	// please do not change any of the following code,
 	// or do anything to subvert it.

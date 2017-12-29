@@ -31,7 +31,6 @@ import "sync/atomic"
 import "fmt"
 import "math/rand"
 
-
 // px.Status() return values, indicating
 // whether an agreement has been decided,
 // or Paxos has not yet reached agreement,
@@ -44,6 +43,81 @@ const (
 	Forgotten      // decided but forgotten.
 )
 
+type SeqInstance struct {
+	sync.RWMutex
+
+	fate Fate
+
+	// acceptor state
+	np int // higest prepare proposal seen
+	// higest accept proposal seen
+	na int
+	va interface{}
+}
+
+func newSeqInstance() *SeqInstance {
+	return &SeqInstance{
+		fate: Pending,
+	}
+}
+
+func (si *SeqInstance) Status() Fate {
+	si.RLock()
+	defer si.RUnlock()
+	return si.fate
+}
+
+func (si *SeqInstance) SetStatus(fate Fate) {
+	si.Lock()
+	defer si.Unlock()
+	si.fate = fate
+}
+
+func (si *SeqInstance) Np() int {
+	si.RLock()
+	defer si.RUnlock()
+	return si.np
+}
+
+func (si *SeqInstance) Value() interface{} {
+	si.RLock()
+	defer si.RUnlock()
+	return si.va
+}
+
+type PrepareArgs struct {
+	Seq int
+	N   int // proposal
+}
+
+type PrepareReply struct {
+	Ok bool // true: ok, false: reject
+	Na int
+	Va interface{}
+	Np int
+
+	Done int
+}
+
+type AcceptArgs struct {
+	Seq int
+	N   int
+	V   interface{}
+}
+
+type AcceptReply struct {
+	Ok bool
+}
+
+type DecideArgs struct {
+	Seq int
+	V   interface{}
+}
+
+type DecideReply struct {
+	Ok bool
+}
+
 type Paxos struct {
 	mu         sync.Mutex
 	l          net.Listener
@@ -53,8 +127,14 @@ type Paxos struct {
 	peers      []string
 	me         int // index into peers[]
 
-
 	// Your data here.
+	sync.RWMutex
+	seqInstances []*SeqInstance
+	done         int
+	peerDones    []int
+
+	minSeq int
+	maxSeq int
 }
 
 //
@@ -93,7 +173,6 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 	return false
 }
 
-
 //
 // the application wants paxos to start agreement on
 // instance seq, with proposed value v.
@@ -101,8 +180,205 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 // call Status() to find out if/when agreement
 // is reached.
 //
+
+func (px *Paxos) seqInstanceBySeq(seq int) *SeqInstance {
+	if seq < px.minSeq {
+		return nil
+	}
+	if seq >= len(px.seqInstances) {
+		newSeqInstances := make([]*SeqInstance, 2*seq+1)
+		copy(newSeqInstances, px.seqInstances)
+		px.seqInstances = newSeqInstances
+	}
+
+	si := px.seqInstances[seq]
+	if si == nil {
+		px.seqInstances[seq] = newSeqInstance()
+		si = px.seqInstances[seq]
+	}
+
+	if seq > px.maxSeq {
+		px.maxSeq = seq
+	}
+
+	return si
+}
+
+func (px *Paxos) makeHigherProposalId(curMaxProposalId int) int {
+	return (curMaxProposalId/10000+1)*10000 + px.me
+}
+
+func (px *Paxos) updatePeerDone(index int, done int) {
+	px.Lock()
+	defer px.Unlock()
+
+	if done > px.peerDones[index] {
+		px.peerDones[index] = done
+	}
+}
+
+func (px *Paxos) updateMinSeq() {
+	px.Lock()
+	defer px.Unlock()
+
+	var minDone int = px.done
+	for _, done := range px.peerDones {
+		if done < minDone {
+			minDone = done
+		}
+	}
+
+	if minDone >= px.minSeq {
+		for i := px.minSeq; i < minDone+1; i++ {
+			si := px.seqInstances[i]
+			si.SetStatus(Forgotten)
+			px.seqInstances[i] = nil
+		}
+		px.minSeq = minDone + 1
+	}
+}
+
 func (px *Paxos) Start(seq int, v interface{}) {
 	// Your code here.
+	si := px.seqInstanceBySeq(seq)
+	if si == nil {
+		return
+	}
+	if si.Status() != Pending {
+		return
+	}
+
+	go func() {
+		curMaxProposalId := si.Np()
+		//log.Printf("begin si=%+v", *si)
+		for si.Status() == Pending && !px.isdead() {
+			proposalId := px.makeHigherProposalId(curMaxProposalId)
+			curMaxProposalId = proposalId
+
+			var replyOkCount int
+			var highestNa int
+			var va interface{}
+			for index, peer := range px.peers {
+				var reply PrepareReply
+				args := &PrepareArgs{seq, proposalId}
+				if index == px.me {
+					if err := px.HandlePrepare(args, &reply); err != nil {
+						continue
+					}
+				} else {
+					if !call(peer, "Paxos.HandlePrepare", args, &reply) {
+						continue
+					}
+				}
+				if reply.Ok {
+					if reply.Na > highestNa {
+						highestNa = reply.Na
+						va = reply.Va
+					}
+					replyOkCount++
+				}
+				if reply.Np > curMaxProposalId {
+					curMaxProposalId = reply.Np
+				}
+				px.updatePeerDone(index, reply.Done)
+			}
+			//log.Printf("Prepare accept =%v", replyOkCount)
+			px.updateMinSeq()
+			if replyOkCount >= len(px.peers)/2+1 {
+				if va == nil {
+					va = v
+				}
+				replyOkCount = 0
+				for index, peer := range px.peers {
+					var reply AcceptReply
+					args := &AcceptArgs{seq, proposalId, va}
+					if index == px.me {
+						if err := px.HandleAccept(args, &reply); err != nil {
+							continue
+						}
+					} else {
+						if !call(peer, "Paxos.HandleAccept", args, &reply) {
+							continue
+						}
+					}
+					if reply.Ok {
+						replyOkCount++
+					}
+				}
+				if replyOkCount >= len(px.peers)/2+1 {
+					for index, peer := range px.peers {
+						var reply DecideReply
+						args := &DecideArgs{seq, va}
+						if index == px.me {
+							if err := px.HandleDecide(args, &reply); err != nil {
+								continue
+							}
+						} else {
+							if !call(peer, "Paxos.HandleDecide", args, &reply) {
+								continue
+							}
+						}
+					}
+					break
+				}
+			}
+		}
+	}()
+}
+
+// acceptor
+func (px *Paxos) HandlePrepare(args *PrepareArgs, reply *PrepareReply) error {
+	px.Lock()
+	defer px.Unlock()
+
+	si := px.seqInstanceBySeq(args.Seq)
+	si.Lock()
+	defer si.Unlock()
+
+	if args.N > si.np {
+		reply.Na = si.na
+		reply.Va = si.va
+		reply.Ok = true
+		si.np = args.N
+	} else {
+		reply.Ok = false
+	}
+	reply.Np = si.np
+	reply.Done = px.done
+	return nil
+}
+
+func (px *Paxos) HandleAccept(args *AcceptArgs, reply *AcceptReply) error {
+	px.Lock()
+	defer px.Unlock()
+
+	//	log.Printf("HandleAccept calling, args=%+v, px=%+v", *args, *px)
+	si := px.seqInstanceBySeq(args.Seq)
+	si.Lock()
+	defer si.Unlock()
+
+	if args.N >= si.np {
+		si.np = args.N
+		si.na = args.N
+		si.va = args.V
+		reply.Ok = true
+	} else {
+		reply.Ok = false
+	}
+	return nil
+}
+
+func (px *Paxos) HandleDecide(args *DecideArgs, reply *DecideReply) error {
+	px.Lock()
+	defer px.Unlock()
+
+	si := px.seqInstanceBySeq(args.Seq)
+	si.Lock()
+	defer si.Unlock()
+
+	si.fate = Decided
+	si.va = args.V
+	return nil
 }
 
 //
@@ -111,8 +387,26 @@ func (px *Paxos) Start(seq int, v interface{}) {
 //
 // see the comments for Min() for more explanation.
 //
-func (px *Paxos) Done(seq int) {
+func (px *Paxos) Done(done int) {
 	// Your code here.
+	px.Lock()
+	defer px.Unlock()
+
+	if px.done >= done {
+		return
+	}
+
+	var i int
+	for i = px.done; i <= done; i++ {
+		if i < 0 {
+			continue
+		}
+		si := px.seqInstances[i]
+		if si == nil || si.Status() != Decided {
+			break
+		}
+	}
+	px.done = i - 1
 }
 
 //
@@ -121,8 +415,9 @@ func (px *Paxos) Done(seq int) {
 // this peer.
 //
 func (px *Paxos) Max() int {
-	// Your code here.
-	return 0
+	px.RLock()
+	defer px.RUnlock()
+	return px.maxSeq
 }
 
 //
@@ -155,7 +450,9 @@ func (px *Paxos) Max() int {
 //
 func (px *Paxos) Min() int {
 	// You code here.
-	return 0
+	px.RLock()
+	defer px.RUnlock()
+	return px.minSeq
 }
 
 //
@@ -167,10 +464,14 @@ func (px *Paxos) Min() int {
 //
 func (px *Paxos) Status(seq int) (Fate, interface{}) {
 	// Your code here.
-	return Pending, nil
+	px.RLock()
+	defer px.RUnlock()
+	if seq < px.minSeq {
+		return Forgotten, nil
+	}
+	si := px.seqInstanceBySeq(seq)
+	return si.Status(), si.Value()
 }
-
-
 
 //
 // tell the peer to shut itself down.
@@ -214,8 +515,12 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 	px.peers = peers
 	px.me = me
 
-
 	// Your initialization code here.
+	px.peerDones = make([]int, len(peers))
+	for i := range px.peerDones {
+		px.peerDones[i] = -1
+	}
+	px.done = -1
 
 	if rpcs != nil {
 		// caller will create socket &c
@@ -267,7 +572,6 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 			}
 		}()
 	}
-
 
 	return px
 }
